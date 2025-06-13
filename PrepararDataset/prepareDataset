@@ -1,0 +1,172 @@
+"""
+Module for extracting overlapping patches from images and masks,
+and automatically splitting them into training, testing and validation sets.
+"""
+
+import os
+from pathlib import Path
+import cv2
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+# NOTE: numpy as np is required but not imported in the original code.
+
+# --- Global Parameters ---
+PATCH_SIZE = 512            # pixel size for extracted patches
+TRAIN_RATIO = 0.8           # fraction of patches for training
+TEST_RATIO = 0.1            # fraction of patches for testing
+# Implicit VAL_RATIO = 1 - (TRAIN_RATIO + TEST_RATIO)
+OVERLAP = 0.5               # overlap ratio (50%), implemented via patch_size//2
+
+def create_output_dirs(output_base: Path) -> None:
+    """Create 'train', 'test' and 'val' subdirectories each with 'images' and 'masks'.
+
+    Args:
+        output_base (Path): Base directory under which split folders are created.
+
+    Returns:
+        None
+    """
+    for split in ["train", "test", "val"]:
+        (output_base / split / "images").mkdir(parents=True, exist_ok=True)
+        (output_base / split / "masks").mkdir(parents=True, exist_ok=True)
+
+def pad_patch(patch: np.ndarray, patch_size: int = PATCH_SIZE) -> np.ndarray:
+    """Pad a patch with black pixels if its dimensions are smaller than patch_size.
+
+    Args:
+        patch (np.ndarray): Image or mask array.
+        patch_size (int): Desired square patch size in pixels.
+
+    Returns:
+        np.ndarray: Patch padded up to (patch_size × patch_size), preserving channels.
+
+    Raises:
+        NameError: if numpy (`np`) is not imported.
+    """
+    h, w = patch.shape[:2]
+    pad_bottom = max(patch_size - h, 0)
+    pad_right  = max(patch_size - w, 0)
+    # Choose padding color: black for both image (3 channels) or mask (1 channel)
+    value = [0, 0, 0] if patch.ndim == 3 else 0
+    return cv2.copyMakeBorder(
+        patch, 0, pad_bottom, 0, pad_right,
+        cv2.BORDER_CONSTANT, value=value
+    )
+
+def extract_and_save_patches(
+    image_path: Path,
+    mask_path: Path,
+    output_base: Path,
+    patch_size: int = PATCH_SIZE
+) -> None:
+    """Extract overlapping patches from an image and its mask, then save to splits.
+
+    Args:
+        image_path (Path): Path to the input color TIFF image (BGR).
+        mask_path (Path): Path to the input grayscale PNG mask.
+        output_base (Path): Base directory where 'train', 'test', 'val' exist.
+        patch_size (int): Size of each square patch in pixels.
+
+    Returns:
+        None
+
+    Side Effects:
+        - Reads image and mask from disk.
+        - Creates and pads patches.
+        - Randomly assigns each patch to 'train', 'test' or 'val'.
+        - Writes patches as PNG into corresponding subfolders.
+    """
+    img  = cv2.imread(str(image_path))                              # BGR
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)         # gray
+
+    if img is None or mask is None:
+        print(f"Error reading {image_path} or {mask_path}; skipping.")
+        return
+
+    height, width = img.shape[:2]
+    base_name = image_path.stem
+    step = patch_size // 2   # 50% overlap
+
+    for i in range(0, height, step):
+        for j in range(0, width, step):
+            # Crop patch (may be smaller at borders)
+            patch_img  = img [i:min(i+patch_size, height), j:min(j+patch_size, width)]
+            patch_mask = mask[i:min(i+patch_size, height), j:min(j+patch_size, width)]
+            # Pad to exact size if needed
+            patch_img  = pad_patch(patch_img,  patch_size)
+            patch_mask = pad_patch(patch_mask, patch_size)
+
+            # Random split selection
+            r = random.random()
+            if r < TRAIN_RATIO:
+                split = "train"
+            elif r < TRAIN_RATIO + TEST_RATIO:
+                split = "test"
+            else:
+                split = "val"
+
+            file_name = f"{base_name}_{i}_{j}.png"
+            img_out_path  = output_base / split / "images" / file_name
+            mask_out_path = output_base / split / "masks"  / file_name
+
+            cv2.imwrite(str(img_out_path),  patch_img)
+            cv2.imwrite(str(mask_out_path), patch_mask)
+            print(f"Patch {file_name} saved in {split}.")
+
+def process_dataset(
+    input_images_dir: str,
+    input_masks_dir: str,
+    output_dir: str,
+    patch_size: int = PATCH_SIZE,
+    max_workers: int = None
+) -> None:
+    """Scan a directory of images, extract patches in parallel, and save them.
+
+    Args:
+        input_images_dir (str): Directory containing .tif/.tiff image files.
+        input_masks_dir (str): Directory containing corresponding .png masks.
+        output_dir (str): Base directory for output splits.
+        patch_size (int): Size of each patch, in pixels.
+        max_workers (int): Number of threads for parallel execution (None = auto).
+
+    Returns:
+        None
+    """
+    input_images_dir = Path(input_images_dir)
+    input_masks_dir  = Path(input_masks_dir)
+    output_base      = Path(output_dir)
+
+    create_output_dirs(output_base)
+    valid_ext = ('.tif', '.tiff')
+
+    tasks = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for img_file in input_images_dir.iterdir():
+            if img_file.suffix.lower() in valid_ext:
+                mask_file = input_masks_dir / f"{img_file.stem}.png"
+                if mask_file.exists():
+                    tasks.append(
+                        executor.submit(
+                            extract_and_save_patches,
+                            img_file, mask_file, output_base, patch_size
+                        )
+                    )
+                else:
+                    print(f"No mask found for {img_file.name}.")
+
+        for future in as_completed(tasks):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"Error during processing: {e}")
+
+def main() -> None:
+    """Entry point: define paths and launch dataset processing."""
+    input_images_dir = ""  
+    input_masks_dir  = ""
+    output_dir       = ""
+    max_workers = os.cpu_count() or 4
+    process_dataset(input_images_dir, input_masks_dir, output_dir, PATCH_SIZE, max_workers)
+
+if __name__ == "__main__":
+    main()
